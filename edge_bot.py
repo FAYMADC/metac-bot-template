@@ -26,6 +26,7 @@ and reflexive 50% hedging.
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Literal
 
@@ -77,6 +78,68 @@ CALIBRATION_RULES = """
     - Most things that have not happened yet do not happen in a short window.
       The shorter the time to resolution, the harder the status quo pulls.
 """
+
+
+# --------------------------------------------------------------------- #
+# MODEL TIERS
+#
+# "free"     — OpenRouter zero-cost models. Used to prove the four-stage
+#              chain end to end before the season starts, and whenever no
+#              paid credits are available. Free models are heavily rate
+#              limited, so the chain also runs at reduced depth here.
+# "frontier" — the real configuration. Set EDGEBOT_TIER=frontier once LLM
+#              credits land; nothing else needs to change.
+# --------------------------------------------------------------------- #
+
+TIER = os.getenv("EDGEBOT_TIER", "free").strip().lower()
+
+FREE_REASONER = "openrouter/nex-agi/nex-n2.5-pro:free"
+FREE_SMALL = "openrouter/nex-agi/nex-n2.5-mini:free"
+
+
+def build_llm_config(tier: str) -> tuple[dict, int, int]:
+    """Return (llms, research_reports_per_question, predictions_per_report)."""
+    if tier == "frontier":
+        return (
+            {
+                "default": GeneralLlm(
+                    model=os.getenv(
+                        "EDGEBOT_MODEL", "openrouter/anthropic/claude-opus-4.5"
+                    ),
+                    temperature=0.3,
+                    timeout=120,
+                    allowed_tries=2,
+                ),
+                "summarizer": os.getenv(
+                    "EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"
+                ),
+                "researcher": os.getenv(
+                    "EDGEBOT_RESEARCH_MODEL",
+                    "openrouter/perplexity/sonar-reasoning",
+                ),
+                "parser": os.getenv(
+                    "EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"
+                ),
+            },
+            3,
+            2,
+        )
+    # free tier: one research report, one forecast, still the full four stages
+    return (
+        {
+            "default": GeneralLlm(
+                model=FREE_REASONER,
+                temperature=0.3,
+                timeout=180,
+                allowed_tries=3,
+            ),
+            "summarizer": FREE_SMALL,
+            "researcher": FREE_REASONER,
+            "parser": FREE_SMALL,
+        },
+        1,
+        1,
+    )
 
 
 class EdgeBot(SummerTemplateBot2026):
@@ -577,17 +640,25 @@ if __name__ == "__main__":
     publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
+    llms, reports_per_question, predictions_per_report = build_llm_config(TIER)
+    logger.info(
+        f"Model tier: {TIER} | research reports/question: {reports_per_question} "
+        f"| forecasts/report: {predictions_per_report}"
+    )
+
     bot = EdgeBot(
-        # Three independent research reports give genuinely different evidence
-        # bases; two forecasts each keeps the median honest without paying for
-        # six full four-stage chains per question.
-        research_reports_per_question=3,
-        predictions_per_research_report=2,
+        # On the frontier tier, three independent research reports give
+        # genuinely different evidence bases and two forecasts each keeps the
+        # median honest. The free tier drops to 1x1 to stay inside the
+        # zero-cost rate limits while still exercising all four stages.
+        research_reports_per_question=reports_per_question,
+        predictions_per_research_report=predictions_per_report,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to="forecast_logs/",
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
+        llms=llms,
     )
 
     client = MetaculusClient()
