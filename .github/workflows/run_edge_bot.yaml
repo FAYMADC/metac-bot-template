@@ -50,6 +50,9 @@ jobs:
         run: |
           poetry run python edge_bot.py --mode "${{ github.event.inputs.mode || 'tournament' }}"
         env:
+          # Flip to 'frontier' (repo Settings -> Variables) the moment
+          # LLM credits land. No code change needed.
+          EDGEBOT_TIER: ${{ vars.EDGEBOT_TIER || 'free' }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
