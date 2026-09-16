@@ -94,10 +94,20 @@ CALIBRATION_RULES = """
 TIER = os.getenv("EDGEBOT_TIER", "free").strip().lower()
 
 # The free models are for proving the chain runs, not for scoring well. What
-# matters here is latency, not quality: a slow call blocks the whole run, and
-# the job has a hard timeout. So use the smaller model and fail fast.
-FREE_REASONER = "openrouter/nex-agi/nex-n2.5-mini:free"
-FREE_SMALL = "openrouter/nex-agi/nex-n2.5-mini:free"
+# matters here is latency, not quality: a slow call blocks the whole run and
+# the job has a hard timeout.
+#
+# OpenRouter currently lists only eight zero-cost models, none from the major
+# labs. The nex-agi pair timed out on 100% of calls (180s, every request), so
+# the default is NVIDIA's "lightning" model instead. Override without touching
+# code by setting the EDGEBOT_FREE_MODEL repo variable. Other candidates:
+#   openrouter/inclusionai/ling-3.0-flash-vl:free
+#   openrouter/nex-agi/nex-n2.5-mini:free
+#   openrouter/liquid/lfm-2.5-2.6b:free
+FREE_REASONER = os.getenv(
+    "EDGEBOT_FREE_MODEL", "openrouter/nvidia/nemotron-3.5-lightning:free"
+)
+FREE_SMALL = os.getenv("EDGEBOT_FREE_SMALL_MODEL", FREE_REASONER)
 
 
 def build_llm_config(tier: str) -> tuple[dict, int, int]:
