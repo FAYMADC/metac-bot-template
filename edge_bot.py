@@ -93,7 +93,10 @@ CALIBRATION_RULES = """
 
 TIER = os.getenv("EDGEBOT_TIER", "free").strip().lower()
 
-FREE_REASONER = "openrouter/nex-agi/nex-n2.5-pro:free"
+# The free models are for proving the chain runs, not for scoring well. What
+# matters here is latency, not quality: a slow call blocks the whole run, and
+# the job has a hard timeout. So use the smaller model and fail fast.
+FREE_REASONER = "openrouter/nex-agi/nex-n2.5-mini:free"
 FREE_SMALL = "openrouter/nex-agi/nex-n2.5-mini:free"
 
 
@@ -130,8 +133,10 @@ def build_llm_config(tier: str) -> tuple[dict, int, int]:
             "default": GeneralLlm(
                 model=FREE_REASONER,
                 temperature=0.3,
-                timeout=180,
-                allowed_tries=3,
+                # 60s x 2 tries, not 180 x 3. A stuck free-tier call must cost
+                # two minutes, not nine, or one bad question eats the run.
+                timeout=60,
+                allowed_tries=2,
             ),
             "summarizer": FREE_SMALL,
             "researcher": FREE_REASONER,
@@ -622,7 +627,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "minibench", "metaculus_cup", "test_questions"],
+        choices=[
+            "tournament",
+            "minibench",
+            "metaculus_cup",
+            "test_questions",
+            "single",
+        ],
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
@@ -633,7 +644,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     run_mode: Literal[
-        "tournament", "minibench", "metaculus_cup", "test_questions"
+        "tournament", "minibench", "metaculus_cup", "test_questions", "single"
     ] = args.mode
 
     check_environment(strict=True)
@@ -685,6 +696,24 @@ if __name__ == "__main__":
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
         )
+    elif run_mode == "single":
+        # Smoke test. Forecast exactly ONE question and stop. The point is to
+        # prove the four-stage chain completes and publishes, not to score.
+        # Prefer a binary question: simplest type, exercises the whole chain.
+        bot.skip_previously_forecasted_questions = False
+        all_questions = client.get_all_open_questions_from_tournament(
+            "bot-testing-area"
+        )
+        binaries = [q for q in all_questions if isinstance(q, BinaryQuestion)]
+        chosen = (binaries or all_questions)[:1]
+        if not chosen:
+            logger.error("No open questions found in bot-testing-area.")
+            reports = []
+        else:
+            logger.info(f"SMOKE TEST on a single question: {chosen[0].page_url}")
+            reports = asyncio.run(
+                bot.forecast_questions(chosen, return_exceptions=True)
+            )
     else:
         bot.skip_previously_forecasted_questions = False
         reports = asyncio.run(
