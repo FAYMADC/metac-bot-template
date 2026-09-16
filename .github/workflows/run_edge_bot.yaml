@@ -13,6 +13,7 @@ on:
           - minibench
           - metaculus_cup
           - test_questions
+          - single
   schedule:
     # Every 20 minutes, offset off the hour so we are not competing with every
     # other bot that left the template cron untouched. Already-forecasted
