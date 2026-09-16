@@ -54,6 +54,9 @@ jobs:
           # Flip to 'frontier' (repo Settings -> Variables) the moment
           # LLM credits land. No code change needed.
           EDGEBOT_TIER: ${{ vars.EDGEBOT_TIER || 'free' }}
+          # Swap the free model without editing code: repo Settings ->
+          # Variables -> EDGEBOT_FREE_MODEL
+          EDGEBOT_FREE_MODEL: ${{ vars.EDGEBOT_FREE_MODEL }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
