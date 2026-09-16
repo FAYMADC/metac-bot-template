@@ -91,7 +91,19 @@ CALIBRATION_RULES = """
 #              credits land; nothing else needs to change.
 # --------------------------------------------------------------------- #
 
-TIER = os.getenv("EDGEBOT_TIER", "free").strip().lower()
+def _env(name: str, default: str) -> str:
+    """os.getenv, but an empty value counts as unset.
+
+    GitHub Actions sets `VAR: ${{ vars.X }}` to an EMPTY STRING when the repo
+    variable does not exist, rather than leaving it undefined. os.getenv would
+    then hand back "" instead of the default, and litellm fails with
+    "LLM Provider NOT provided. You passed model=". Hence this wrapper.
+    """
+    value = os.getenv(name, "")
+    return value.strip() or default
+
+
+TIER = _env("EDGEBOT_TIER", "free").lower()
 
 # The free models are for proving the chain runs, not for scoring well. What
 # matters here is latency, not quality: a slow call blocks the whole run and
@@ -104,10 +116,10 @@ TIER = os.getenv("EDGEBOT_TIER", "free").strip().lower()
 #   openrouter/inclusionai/ling-3.0-flash-vl:free
 #   openrouter/nex-agi/nex-n2.5-mini:free
 #   openrouter/liquid/lfm-2.5-2.6b:free
-FREE_REASONER = os.getenv(
+FREE_REASONER = _env(
     "EDGEBOT_FREE_MODEL", "openrouter/nvidia/nemotron-3.5-lightning:free"
 )
-FREE_SMALL = os.getenv("EDGEBOT_FREE_SMALL_MODEL", FREE_REASONER)
+FREE_SMALL = _env("EDGEBOT_FREE_SMALL_MODEL", FREE_REASONER)
 
 
 def build_llm_config(tier: str) -> tuple[dict, int, int]:
@@ -116,21 +128,21 @@ def build_llm_config(tier: str) -> tuple[dict, int, int]:
         return (
             {
                 "default": GeneralLlm(
-                    model=os.getenv(
+                    model=_env(
                         "EDGEBOT_MODEL", "openrouter/anthropic/claude-opus-4.5"
                     ),
                     temperature=0.3,
                     timeout=120,
                     allowed_tries=2,
                 ),
-                "summarizer": os.getenv(
+                "summarizer": _env(
                     "EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"
                 ),
-                "researcher": os.getenv(
+                "researcher": _env(
                     "EDGEBOT_RESEARCH_MODEL",
                     "openrouter/perplexity/sonar-reasoning",
                 ),
-                "parser": os.getenv(
+                "parser": _env(
                     "EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"
                 ),
             },
