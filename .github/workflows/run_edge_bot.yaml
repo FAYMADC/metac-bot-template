@@ -1,5 +1,12 @@
 name: EdgeBot — forecast on tournament questions
 
+# Coverage: MiniBench questions are only open ~3 hours each, and GitHub's
+# cron fires irregularly (in practice every few hours). So each scheduled run
+# keeps polling Metaculus every 10 minutes for up to ~5h20m, which bridges the
+# gaps between cron firings. If a run is already polling when the cron fires,
+# the new run exits within seconds.
+# Nothing here exits non-zero for normal conditions, so GitHub sends no mail.
+
 on:
   workflow_dispatch:
     inputs:
@@ -15,37 +22,59 @@ on:
           - test_questions
           - single
           - probe
+      loop_minutes:
+        description: "Keep polling for new questions this many minutes (0 = one pass)"
+        required: false
+        default: "320"
   schedule:
-    # Every 20 minutes, offset off the hour so we are not competing with every
-    # other bot that left the template cron untouched. Runs with nothing new
-    # to forecast exit in seconds and make zero LLM calls.
-    - cron: "11,31,51 * * * *"
+    - cron: "17 * * * *"
 
-# GITHUB_TOKEN may call GitHub Models (free tier), and read the repo. Nothing else.
+# Read the repo, call GitHub Models (free tier), see whether another run of
+# this workflow is active. Nothing else.
 permissions:
   contents: read
   models: read
-
-# One run at a time. Overlapping runs would double-forecast the same questions.
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
+  actions: read
 
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    # The bot stops itself at 40 minutes (EDGEBOT_RUN_BUDGET_MINUTES) and
-    # exits cleanly; this is only a backstop.
-    timeout-minutes: 55
+    timeout-minutes: 350
+    env:
+      MODE: ${{ github.event.inputs.mode || 'tournament' }}
+      LOOP_MINUTES: ${{ github.event.inputs.loop_minutes || '320' }}
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Skip if another EdgeBot run is already polling
+        id: guard
+        run: |
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          if [ "$MODE" != "tournament" ] && [ "$MODE" != "minibench" ]; then
+            echo "active=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          older=$(gh run list -R "$GITHUB_REPOSITORY" --workflow run_edge_bot.yaml \
+            --limit 30 --json databaseId,status \
+            --jq "[.[] | select(.status != \"completed\" and .databaseId < ${GITHUB_RUN_ID})] | length" \
+            || echo 0)
+          echo "Older active runs: ${older}"
+          if [ "${older:-0}" -gt 0 ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+            echo "Another run is already polling; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out repository
+        if: steps.guard.outputs.active != 'true'
         uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.active != 'true'
         with:
           python-version: "3.11"
 
       - name: Install poetry
+        if: steps.guard.outputs.active != 'true'
         uses: snok/install-poetry@v1
         with:
           virtualenvs-create: true
@@ -53,23 +82,27 @@ jobs:
           installer-parallel: true
 
       - name: Cache dependencies
+        if: steps.guard.outputs.active != 'true'
         uses: actions/cache@v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-py311-${{ hashFiles('poetry.lock') }}
 
       - name: Install dependencies
+        if: steps.guard.outputs.active != 'true'
         run: poetry install --no-interaction --no-root
 
       - name: Run EdgeBot
+        id: bot
+        if: steps.guard.outputs.active != 'true'
         run: |
-          poetry run python edge_bot.py --mode "${{ github.event.inputs.mode || 'tournament' }}"
+          poetry run python edge_bot.py --mode "$MODE" --loop-minutes "$LOOP_MINUTES" --poll-minutes 10
         env:
-          # "auto" probes every backend each run and uses the best that
-          # answers. Force a fixed setup via repo variable EDGEBOT_TIER.
+          # "auto" probes every backend each cycle that has work and uses the
+          # best that answers. Force a fixed setup via repo variable EDGEBOT_TIER.
           EDGEBOT_TIER: ${{ vars.EDGEBOT_TIER || 'auto' }}
           EDGEBOT_FREE_MODEL: ${{ vars.EDGEBOT_FREE_MODEL }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -80,7 +113,7 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
 
       - name: Upload forecast logs
-        if: always()
+        if: always() && steps.guard.outputs.active != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: forecast-logs-${{ github.run_id }}
