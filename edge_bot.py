@@ -132,28 +132,51 @@ FREE_SMALL = _env("EDGEBOT_FREE_SMALL_MODEL", FREE_REASONER)
 
 GITHUB_MODELS_URL = "https://models.github.ai/inference"
 POLLINATIONS_URL = "https://text.pollinations.ai/openai"
+LLM7_URL = "https://api.llm7.io/v1"
+_GITHUB_HEADERS = (
+    ("Accept", "application/vnd.github+json"),
+    ("X-GitHub-Api-Version", "2022-11-28"),
+)
 
 
 @dataclass(frozen=True)
 class Backend:
-    """One way of reaching one model."""
+    """One way of reaching one model.
+
+    `raw=True` backends are plain OpenAI-compatible HTTP endpoints called
+    directly (RawChatLlm) instead of through litellm. That gives exact error
+    messages, per-endpoint pacing and Retry-After handling, which the free
+    endpoints need and litellm hides.
+    """
 
     label: str
-    model: str  # litellm model string, as GeneralLlm expects it
+    model: str  # litellm model string (litellm backends) / placeholder (raw)
     quality: int  # higher = better forecaster; orders the main chain
     cheap: bool = False  # fine for parsing; preferred for the parser chain
     timeout: int = 120
     base_url: str | None = None
     api_key_env: str | None = None
     api_key_literal: str | None = None
+    raw: bool = False
+    wire_model: str | None = None  # model id sent over the wire (raw only)
+    headers: tuple = ()  # extra HTTP headers (raw only)
+    min_interval: float = 0.0  # seconds between requests (raw only)
+    rate_limit_wait: int | None = None  # wait on a 429 with no Retry-After
+
+    def api_key(self) -> str | None:
+        if self.api_key_literal is not None:
+            return self.api_key_literal
+        if self.api_key_env:
+            return os.getenv(self.api_key_env, "").strip() or None
+        return None
 
     def build(self, timeout: int | None = None) -> GeneralLlm:
+        if self.raw:
+            return RawChatLlm(self, timeout or self.timeout)
         kwargs: dict = {}
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        key = self.api_key_literal
-        if key is None and self.api_key_env:
-            key = os.getenv(self.api_key_env, "").strip() or None
+        key = self.api_key()
         if key:
             kwargs["api_key"] = key
         # allowed_tries=1: retrying is the chain's job, not the backend's. A
@@ -165,6 +188,119 @@ class Backend:
             allowed_tries=1,
             **kwargs,
         )
+
+
+class HttpLlmError(RuntimeError):
+    """An HTTP-level failure, carrying the status code for routing."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class EmptyAnswerError(RuntimeError):
+    """The endpoint answered 200 but with no usable text."""
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    value = response.headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+class RawChatLlm(GeneralLlm):
+    """Minimal OpenAI-compatible chat client, used instead of litellm for the
+    free endpoints. Only `.invoke` matters to the rest of the framework."""
+
+    _locks: dict[str, asyncio.Lock] = {}
+    _last_call: dict[str, float] = {}
+
+    def __init__(self, backend: Backend, timeout: int) -> None:
+        super().__init__(
+            model=backend.model, temperature=0.3, timeout=timeout, allowed_tries=1
+        )
+        self.backend = backend
+        self.request_timeout = timeout
+
+    @staticmethod
+    def _messages(prompt, system_prompt: str | None) -> list[dict]:
+        if isinstance(prompt, list):
+            return prompt
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": str(prompt)})
+        return messages
+
+    async def _pace(self) -> None:
+        interval = self.backend.min_interval
+        if not interval:
+            return
+        lock = self._locks.setdefault(self.backend.label, asyncio.Lock())
+        async with lock:
+            wait = self._last_call.get(self.backend.label, 0.0) + interval
+            wait -= time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call[self.backend.label] = time.monotonic()
+
+    async def invoke(self, prompt, system_prompt: str | None = None) -> str:
+        b = self.backend
+        headers = {"Content-Type": "application/json", **dict(b.headers)}
+        key = b.api_key()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        payload = {
+            "model": b.wire_model,
+            "messages": self._messages(prompt, system_prompt),
+            "temperature": 0.3,
+        }
+        url = (b.base_url or "").rstrip("/") + "/chat/completions"
+        for attempt in range(3):
+            await self._pace()
+            response = await asyncio.to_thread(
+                requests.post,
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self.request_timeout,
+            )
+            if response.status_code == 429 and attempt < 2:
+                wait = _retry_after_seconds(response) or b.rate_limit_wait
+                if wait is not None and wait <= 90:
+                    logger.info(f"{b.label}: 429, waiting {wait:.0f}s")
+                    await asyncio.sleep(wait + 1)
+                    continue
+            if response.status_code != 200:
+                body = " ".join(response.text.split())[:300]
+                raise HttpLlmError(
+                    response.status_code, f"HTTP {response.status_code}: {body}"
+                )
+            try:
+                data = response.json()
+            except ValueError:
+                body = " ".join(response.text.split())[:300]
+                raise HttpLlmError(502, f"200 but not JSON: {body}")
+            choices = data.get("choices") or []
+            if not choices:
+                raise HttpLlmError(502, f"200 but no choices: {str(data)[:300]}")
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            if isinstance(content, list):  # some servers return content parts
+                content = "".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+            if not isinstance(content, str) or not content.strip():
+                raise EmptyAnswerError(
+                    f"{b.label}: empty answer "
+                    f"(finish_reason={choices[0].get('finish_reason')})"
+                )
+            return content
+        raise HttpLlmError(429, f"{b.label}: still rate limited after retries")
 
 
 def backend_catalogue() -> list[Backend]:
@@ -185,6 +321,9 @@ def backend_catalogue() -> list[Backend]:
             ),
         ]
     if _has("METACULUS_TOKEN"):
+        # Metaculus sponsors LLM credits for tournament bots. Until an
+        # allowance is granted these answer "You don't have an allowance";
+        # the day it is, they win the probe and lead the chain.
         cat += [
             Backend(
                 "metaculus-proxy/claude-sonnet-4.5",
@@ -201,47 +340,58 @@ def backend_catalogue() -> list[Backend]:
             ),
         ]
     if _has("GITHUB_TOKEN"):
-        gh = dict(base_url=GITHUB_MODELS_URL, api_key_env="GITHUB_TOKEN")
-        # GitHub Models free tier. Limits are per model and per day, so
-        # spreading across several models multiplies the daily budget.
-        # Input is capped at ~8k tokens per request, which is why the
-        # prompts in this file are kept lean.
+        # GitHub Models free tier via the workflow's own token. Limits are per
+        # model per day, so several models multiply the daily budget. Input
+        # is capped at ~8k tokens per request.
+        def gh(label, wire, quality, cheap=False):
+            return Backend(
+                f"github-models/{label}",
+                f"openai/{wire}",
+                quality=quality,
+                cheap=cheap,
+                base_url=GITHUB_MODELS_URL,
+                api_key_env="GITHUB_TOKEN",
+                raw=True,
+                wire_model=wire,
+                headers=_GITHUB_HEADERS,
+                min_interval=5,
+            )
+
         cat += [
-            Backend("github-models/gpt-4.1", "openai/openai/gpt-4.1", quality=7, **gh),
-            Backend(
-                "github-models/deepseek-v3",
-                "openai/deepseek/DeepSeek-V3-0324",
-                quality=6,
-                **gh,
-            ),
-            Backend(
-                "github-models/gpt-4o", "openai/openai/gpt-4o", quality=6, **gh
-            ),
-            Backend(
-                "github-models/gpt-4.1-mini",
-                "openai/openai/gpt-4.1-mini",
-                quality=5,
-                cheap=True,
-                **gh,
-            ),
-            Backend(
-                "github-models/gpt-4o-mini",
-                "openai/openai/gpt-4o-mini",
-                quality=4,
-                cheap=True,
-                **gh,
-            ),
+            gh("gpt-4.1", "openai/gpt-4.1", 7),
+            gh("deepseek-v3", "deepseek/DeepSeek-V3-0324", 6),
+            gh("gpt-4o", "openai/gpt-4o", 6),
+            gh("gpt-4.1-mini", "openai/gpt-4.1-mini", 5, cheap=True),
+            gh("gpt-4o-mini", "openai/gpt-4o-mini", 4, cheap=True),
         ]
-    # Anonymous public endpoint, no key. Low priority: rate limited and of
-    # uncertain model quality, but it keeps the chain alive if all else fails.
+    # Anonymous public endpoints, no key. Rate limited and of modest quality,
+    # but they keep the chain alive when nothing else answers.
     cat.append(
         Backend(
             "pollinations/openai",
             "openai/openai",
             quality=3,
-            timeout=90,
+            timeout=120,
             base_url=POLLINATIONS_URL,
-            api_key_literal="anonymous",
+            raw=True,
+            wire_model="openai",
+            min_interval=16,
+            rate_limit_wait=20,
+        )
+    )
+    cat.append(
+        Backend(
+            "llm7/gpt-4.1-nano",
+            "openai/gpt-4.1-nano",
+            quality=2,
+            cheap=True,
+            timeout=90,
+            base_url=LLM7_URL,
+            api_key_literal="unused",
+            raw=True,
+            wire_model=_env("EDGEBOT_LLM7_MODEL", "gpt-4.1-nano-2025-04-14"),
+            min_interval=6,
+            rate_limit_wait=15,
         )
     )
     if _has("OPENROUTER_API_KEY"):
@@ -249,6 +399,45 @@ def backend_catalogue() -> list[Backend]:
             Backend("openrouter/free", FREE_REASONER, quality=1, timeout=60)
         )
     return cat
+
+
+def list_endpoint_models() -> str:
+    """Probe-mode diagnostics: which model ids each free endpoint offers."""
+    lines = []
+    targets = [
+        ("pollinations", "https://text.pollinations.ai/models", {}),
+        ("llm7", f"{LLM7_URL}/models", {}),
+    ]
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        targets.append(
+            (
+                "github-models",
+                "https://models.github.ai/catalog/models",
+                {"Authorization": f"Bearer {token}", **dict(_GITHUB_HEADERS)},
+            )
+        )
+    for name, url, headers in targets:
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("models") or data
+            ids = []
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        ids.append(str(item.get("id") or item.get("name")))
+                    else:
+                        ids.append(str(item))
+            summary = ", ".join(ids[:60]) if ids else " ".join(response.text.split())[:300]
+            lines.append(f"- **{name}** (HTTP {response.status_code}): {summary}")
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            lines.append(f"- **{name}**: {type(exc).__name__}: {exc}")
+    return "\n".join(lines)
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -1029,17 +1218,32 @@ class EdgeBot(SummerTemplateBot2026):
 # ---------------------------------------------------------------------- #
 # ENTRY POINT                                                            #
 #
-# Exit code policy: a scheduled run exits 0 unless the code itself is
-# broken. "No new questions", "no LLM backend answered" and "some questions
-# failed" are all normal operating states for a bot that runs every 20
-# minutes, and a non-zero exit makes GitHub email the repo owner every
-# time. Problems are reported instead as annotations and in the run's
-# job summary, where they are visible without spamming anyone.
+# Exit code policy: a run exits 0 unless the code itself is broken. "No new
+# questions", "no LLM backend answered" and "some questions failed" are all
+# normal operating states for a bot that runs around the clock, and a
+# non-zero exit makes GitHub email the repo owner every time. Problems are
+# reported instead as annotations and in the run's job summary.
+#
+# Why a polling loop: MiniBench questions open one at a time and each is
+# open for only about three hours. GitHub's cron fires unreliably (in
+# practice a handful of times a day), so a cron-only bot misses most
+# questions. Instead each run stays alive for several hours, checking for
+# new questions every few minutes, and the workflow hands over to a fresh
+# run when this one ends.
 # ---------------------------------------------------------------------- #
 
 RunMode = Literal[
     "tournament", "minibench", "metaculus_cup", "test_questions", "single", "probe"
 ]
+LOOPABLE_MODES = ("tournament", "minibench")
+
+# Questions that failed this many times in this process are left alone, so
+# one question the bot cannot handle does not eat every cycle's LLM budget.
+MAX_ATTEMPTS_PER_QUESTION = 2
+_attempts: dict[str, int] = {}
+# Forecast in this process already; never re-forecast even if the API's
+# "already forecasted" flag lags behind.
+_done: set[str] = set()
 
 
 def write_job_summary(markdown: str) -> None:
@@ -1057,7 +1261,7 @@ def write_job_summary(markdown: str) -> None:
 def annotate(level: str, message: str) -> None:
     """GitHub Actions annotation: shows on the run page, fails nothing."""
     if os.getenv("GITHUB_ACTIONS"):
-        print(f"::{level}::{message}")
+        print(f"::{level}::{message}", flush=True)
     else:
         logger.info(f"[{level}] {message}")
 
@@ -1065,7 +1269,7 @@ def annotate(level: str, message: str) -> None:
 def probe_table(results: list[ProbeResult]) -> str:
     rows = ["| Backend | Result | Seconds | Detail |", "|---|---|---|---|"]
     for r in sorted(results, key=lambda r: (not r.ok, -r.backend.quality)):
-        detail = r.detail.replace("|", "/")[:140]
+        detail = r.detail.replace("|", "/")[:160]
         rows.append(
             f"| {r.backend.label} | {'OK' if r.ok else 'fail'} "
             f"| {r.seconds:.1f} | {detail} |"
@@ -1097,9 +1301,14 @@ def collect_questions(
         try:
             found = client.get_all_open_questions_from_tournament(tournament_id)
         except Exception as exc:  # noqa: BLE001 - one bad feed must not stop the other
-            annotate("warning", f"Could not list tournament {tournament_id}: {exc}")
+            logger.warning(f"Could not list tournament {tournament_id}: {exc}")
             continue
-        fresh = [q for q in found if reforecast or not q.already_forecasted]
+        fresh = [
+            q
+            for q in found
+            if (reforecast or (not q.already_forecasted and q.page_url not in _done))
+            and _attempts.get(q.page_url, 0) < MAX_ATTEMPTS_PER_QUESTION
+        ]
         logger.info(
             f"Tournament {tournament_id}: {len(found)} open, {len(fresh)} to forecast"
         )
@@ -1116,52 +1325,65 @@ def collect_questions(
     return sorted(questions, key=closes)
 
 
-async def run(run_mode: RunMode, publish: bool) -> None:
+async def run_cycle(
+    run_mode: RunMode, publish: bool, budget_minutes: float
+) -> tuple[int, int]:
+    """One pass: find new questions, pick LLMs, forecast. Returns (done, failed)."""
     client = MetaculusClient()
 
-    # 1. Anything to do? Most scheduled runs find nothing new, and those
-    #    runs must cost zero LLM calls: free tiers have small daily quotas.
+    # 1. Anything to do? Most cycles find nothing new, and those must cost
+    #    zero LLM calls: free tiers have small daily quotas.
     if run_mode == "probe":
         questions: list[MetaculusQuestion] = []
     else:
         questions = collect_questions(client, run_mode)
         if not questions:
-            logger.info("No new questions to forecast. Nothing to do.")
-            write_job_summary(f"### EdgeBot ({run_mode})\nNo new questions. Idle run.")
-            return
-        max_per_run = int(_env("EDGEBOT_MAX_QUESTIONS_PER_RUN", "12"))
-        if len(questions) > max_per_run:
+            logger.info("No new questions to forecast.")
+            return 0, 0
+        max_per_cycle = int(_env("EDGEBOT_MAX_QUESTIONS_PER_RUN", "12"))
+        if len(questions) > max_per_cycle:
             logger.info(
-                f"{len(questions)} questions pending; doing the {max_per_run} "
-                "closing soonest now, the rest on the next run."
+                f"{len(questions)} questions pending; doing the {max_per_cycle} "
+                "closing soonest now, the rest next cycle."
             )
-            questions = questions[:max_per_run]
+            questions = questions[:max_per_cycle]
 
-    # 2. Pick the LLMs.
+    # 2. Pick the LLMs. Probed fresh every cycle that has work, because
+    #    quotas reset and credits can land at any time.
+    FallbackLlm.disabled.clear()
+    FallbackLlm.timeouts.clear()
+    FallbackLlm.usage.clear()
     if TIER in ("frontier", "free"):
         llms = build_fixed_llm_config(TIER)
-        reports_per_question, predictions_per_report = (3, 2) if TIER == "frontier" else (1, 1)
+        reports_per_question, predictions_per_report = (
+            (3, 2) if TIER == "frontier" else (1, 1)
+        )
         backend_note = f"fixed tier '{TIER}'"
     else:
         results = await probe_backends(backend_catalogue())
         working = [r.backend for r in results if r.ok]
         table = probe_table(results)
         logger.info("Backend probe:\n" + table)
-        write_job_summary(f"### EdgeBot backend probe\n{table}")
         if run_mode == "probe":
-            return
+            models = await asyncio.to_thread(list_endpoint_models)
+            logger.info("Endpoint model lists:\n" + models)
+            write_job_summary(
+                f"### EdgeBot backend probe\n{table}\n\n#### Models offered\n{models}"
+            )
+            return 0, 0
         if not working:
+            write_job_summary(f"### EdgeBot backend probe\n{table}")
             annotate(
                 "error",
                 f"No LLM backend answered; {len(questions)} question(s) left for the "
-                "next run. See the probe table in the job summary.",
+                "next cycle. See the probe table in the job summary.",
             )
-            return
+            return 0, 0
         llms = llms_from_working(working)
         best = max(working, key=lambda b: b.quality)
-        # Depth scales with what we have. Frontier-class backends get the
-        # full ensemble; quota-limited free backends get one careful pass
-        # per question so the daily budget covers every question.
+        # Depth scales with what we have. Frontier-class backends get an
+        # ensemble; quota-limited free backends get one careful pass per
+        # question so the daily budget covers every question.
         if best.quality >= 9:
             reports_per_question, predictions_per_report = 2, 2
         else:
@@ -1191,10 +1413,8 @@ async def run(run_mode: RunMode, publish: bool) -> None:
         # disagree on formatting would throw away a perfectly good forecast.
         bot._structure_output_validation_samples = 1
 
-    # 3. Forecast, inside a hard time budget so the job never hits GitHub's
-    #    timeout (a cancelled run also emails). Each question is published
-    #    as soon as it is done, so work finished before the cut is kept.
-    budget_minutes = int(_env("EDGEBOT_RUN_BUDGET_MINUTES", "40"))
+    # 3. Forecast inside a hard time budget. Each question is published as
+    #    soon as it is done, so work finished before the cut is kept.
     for q in questions:
         logger.info(f"Queued: {q.page_url}")
     try:
@@ -1205,38 +1425,73 @@ async def run(run_mode: RunMode, publish: bool) -> None:
     except asyncio.TimeoutError:
         annotate(
             "warning",
-            f"Stopped at the {budget_minutes}-minute budget; unfinished questions "
-            "will be picked up by the next run.",
+            f"Cycle stopped at its {budget_minutes:.0f}-minute budget; unfinished "
+            "questions will be retried.",
         )
         reports = []
 
-    ok = [r for r in reports if not isinstance(r, BaseException)]
-    failed = [r for r in reports if isinstance(r, BaseException)]
+    ok, failed = [], []
+    for question, report in zip(questions, reports):
+        if isinstance(report, BaseException):
+            failed.append((question, report))
+            _attempts[question.page_url] = _attempts.get(question.page_url, 0) + 1
+        else:
+            ok.append(question)
+            _done.add(question.page_url)
     bot.log_report_summary(reports, raise_errors=False)
     print_run_summary_banner(reports, will_publish=publish)
 
     usage = ", ".join(f"{k}: {v}" for k, v in sorted(FallbackLlm.usage.items()))
     disabled = "; ".join(f"{k} ({v[:80]})" for k, v in FallbackLlm.disabled.items())
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"### EdgeBot ({run_mode})",
-        f"- Questions attempted: {len(questions)}",
-        f"- Forecasts {'published' if publish else 'made (dry run)'}: {len(ok)}",
-        f"- Failed: {len(failed)}",
+        f"### EdgeBot cycle at {stamp} ({run_mode})",
+        f"- Forecasts {'published' if publish else 'made (dry run)'}: {len(ok)}"
+        f" of {len(questions)}",
         f"- LLM setup: {backend_note}",
     ]
     if usage:
         lines.append(f"- Calls answered per backend: {usage}")
     if disabled:
-        lines.append(f"- Disabled during run: {disabled}")
-    for report in ok:
-        url = getattr(getattr(report, "question", None), "page_url", "")
-        lines.append(f"  - done: {url}")
-    for exc in failed:
-        lines.append(f"  - failed: {' '.join(str(exc).split())[:200]}")
+        lines.append(f"- Disabled during cycle: {disabled}")
+    for question in ok:
+        lines.append(f"  - done: {question.page_url}")
+    for question, exc in failed:
+        lines.append(
+            f"  - failed: {question.page_url} — {' '.join(str(exc).split())[:200]}"
+        )
     write_job_summary("\n".join(lines))
-
     if failed:
-        annotate("warning", f"{len(failed)} of {len(reports)} question(s) failed.")
+        annotate("warning", f"{len(failed)} of {len(questions)} question(s) failed.")
+    return len(ok), len(failed)
+
+
+async def run(
+    run_mode: RunMode, publish: bool, loop_minutes: float, poll_minutes: float
+) -> None:
+    looping = loop_minutes > 0 and run_mode in LOOPABLE_MODES
+    deadline = time.monotonic() + loop_minutes * 60
+    default_budget = float(_env("EDGEBOT_RUN_BUDGET_MINUTES", "40"))
+    cycles = done = failed = 0
+    while True:
+        cycles += 1
+        remaining = (deadline - time.monotonic()) / 60 if looping else default_budget
+        budget = max(5.0, min(default_budget, remaining - 1))
+        try:
+            cycle_done, cycle_failed = await run_cycle(run_mode, publish, budget)
+            done += cycle_done
+            failed += cycle_failed
+        except Exception as exc:  # noqa: BLE001 - a bad cycle must not end the loop
+            logger.exception("Cycle crashed")
+            annotate("warning", f"Cycle {cycles} crashed: {type(exc).__name__}: {exc}")
+        if not looping or time.monotonic() + poll_minutes * 60 > deadline:
+            break
+        await asyncio.sleep(poll_minutes * 60)
+    if looping:
+        write_job_summary(
+            f"### EdgeBot run finished\n- Cycles: {cycles}\n"
+            f"- Forecasts published: {done}\n- Failed: {failed}"
+        )
 
 
 if __name__ == "__main__":
@@ -1259,12 +1514,30 @@ if __name__ == "__main__":
         action="store_true",
         help="Run the full chain but do not publish to Metaculus",
     )
+    parser.add_argument(
+        "--loop-minutes",
+        type=float,
+        default=0,
+        help="Keep checking for new questions for this long (tournament and "
+        "minibench modes). 0 = a single pass.",
+    )
+    parser.add_argument(
+        "--poll-minutes",
+        type=float,
+        default=10,
+        help="Minutes between checks when looping.",
+    )
     args = parser.parse_args()
     run_mode: RunMode = args.mode
 
     check_environment(strict=True)
     publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
-    logger.info(f"Model tier: {TIER}")
+    logger.info(
+        f"Model tier: {TIER} | loop: {args.loop_minutes} min, "
+        f"poll every {args.poll_minutes} min"
+    )
 
-    asyncio.run(run(run_mode, publish_to_metaculus))
+    asyncio.run(
+        run(run_mode, publish_to_metaculus, args.loop_minutes, args.poll_minutes)
+    )
