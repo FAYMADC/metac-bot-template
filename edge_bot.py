@@ -130,13 +130,7 @@ FREE_REASONER = _env(
 )
 FREE_SMALL = _env("EDGEBOT_FREE_SMALL_MODEL", FREE_REASONER)
 
-GITHUB_MODELS_URL = "https://models.github.ai/inference"
 POLLINATIONS_URL = "https://text.pollinations.ai/openai"
-LLM7_URL = "https://api.llm7.io/v1"
-_GITHUB_HEADERS = (
-    ("Accept", "application/vnd.github+json"),
-    ("X-GitHub-Api-Version", "2022-11-28"),
-)
 
 
 @dataclass(frozen=True)
@@ -161,6 +155,7 @@ class Backend:
     wire_model: str | None = None  # model id sent over the wire (raw only)
     headers: tuple = ()  # extra HTTP headers (raw only)
     min_interval: float = 0.0  # seconds between requests (raw only)
+    pace_key: str | None = None  # backends sharing one rate limit share a key
     rate_limit_wait: int | None = None  # wait on a 429 with no Retry-After
 
     def api_key(self) -> str | None:
@@ -240,13 +235,13 @@ class RawChatLlm(GeneralLlm):
         interval = self.backend.min_interval
         if not interval:
             return
-        lock = self._locks.setdefault(self.backend.label, asyncio.Lock())
+        key = self.backend.pace_key or self.backend.label
+        lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
-            wait = self._last_call.get(self.backend.label, 0.0) + interval
-            wait -= time.monotonic()
+            wait = self._last_call.get(key, 0.0) + interval - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
-            self._last_call[self.backend.label] = time.monotonic()
+            self._last_call[key] = time.monotonic()
 
     async def invoke(self, prompt, system_prompt: str | None = None) -> str:
         b = self.backend
@@ -339,61 +334,26 @@ def backend_catalogue() -> list[Backend]:
                 cheap=True,
             ),
         ]
-    if _has("GITHUB_TOKEN"):
-        # GitHub Models free tier via the workflow's own token. Limits are per
-        # model per day, so several models multiply the daily budget. Input
-        # is capped at ~8k tokens per request.
-        def gh(label, wire, quality, cheap=False):
-            return Backend(
-                f"github-models/{label}",
-                f"openai/{wire}",
-                quality=quality,
-                cheap=cheap,
-                base_url=GITHUB_MODELS_URL,
-                api_key_env="GITHUB_TOKEN",
-                raw=True,
-                wire_model=wire,
-                headers=_GITHUB_HEADERS,
-                min_interval=5,
-            )
-
-        cat += [
-            gh("gpt-4.1", "openai/gpt-4.1", 7),
-            gh("deepseek-v3", "deepseek/DeepSeek-V3-0324", 6),
-            gh("gpt-4o", "openai/gpt-4o", 6),
-            gh("gpt-4.1-mini", "openai/gpt-4.1-mini", 5, cheap=True),
-            gh("gpt-4o-mini", "openai/gpt-4o-mini", 4, cheap=True),
-        ]
-    # Anonymous public endpoints, no key. Rate limited and of modest quality,
-    # but they keep the chain alive when nothing else answers.
-    cat.append(
-        Backend(
-            "pollinations/openai",
-            "openai/openai",
-            quality=3,
+    # Pollinations: an established open-source platform with a free public
+    # endpoint, no key. Modest models and strict pacing, but it is the one
+    # free option that has answered reliably. Two model ids share one rate
+    # limit, hence one pace key.
+    def pollinations(wire, quality):
+        return Backend(
+            f"pollinations/{wire}",
+            f"openai/{wire}",
+            quality=quality,
+            cheap=True,
             timeout=120,
             base_url=POLLINATIONS_URL,
             raw=True,
-            wire_model="openai",
+            wire_model=wire,
             min_interval=16,
+            pace_key="pollinations",
             rate_limit_wait=20,
         )
-    )
-    cat.append(
-        Backend(
-            "llm7/gpt-4.1-nano",
-            "openai/gpt-4.1-nano",
-            quality=2,
-            cheap=True,
-            timeout=90,
-            base_url=LLM7_URL,
-            api_key_literal="unused",
-            raw=True,
-            wire_model=_env("EDGEBOT_LLM7_MODEL", "gpt-4.1-nano-2025-04-14"),
-            min_interval=6,
-            rate_limit_wait=15,
-        )
-    )
+
+    cat += [pollinations("openai", 3), pollinations("openai-fast", 2)]
     if _has("OPENROUTER_API_KEY"):
         cat.append(
             Backend("openrouter/free", FREE_REASONER, quality=1, timeout=60)
@@ -406,17 +366,7 @@ def list_endpoint_models() -> str:
     lines = []
     targets = [
         ("pollinations", "https://text.pollinations.ai/models", {}),
-        ("llm7", f"{LLM7_URL}/models", {}),
     ]
-    token = os.getenv("GITHUB_TOKEN", "").strip()
-    if token:
-        targets.append(
-            (
-                "github-models",
-                "https://models.github.ai/catalog/models",
-                {"Authorization": f"Bearer {token}", **dict(_GITHUB_HEADERS)},
-            )
-        )
     for name, url, headers in targets:
         try:
             response = requests.get(url, headers=headers, timeout=20)
@@ -470,6 +420,7 @@ _HARD_FAIL_TEXT = (
     "not found",
     "does not exist",
     "unknown model",
+    "unavailable",
     "invalid api key",
     "invalid_api_key",
 )
@@ -579,7 +530,7 @@ async def probe_backends(
                 backend.build(timeout=timeout).invoke(
                     "Reply with the single word OK."
                 ),
-                timeout + 15,
+                timeout + 60,  # room for shared-rate-limit pacing
             )
             return ProbeResult(
                 backend, True, time.monotonic() - start, " ".join(reply.split())[:40]
