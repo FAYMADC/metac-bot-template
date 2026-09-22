@@ -14,11 +14,17 @@ on:
           - metaculus_cup
           - test_questions
           - single
+          - probe
   schedule:
     # Every 20 minutes, offset off the hour so we are not competing with every
-    # other bot that left the template cron untouched. Already-forecasted
-    # questions are skipped, so re-running is cheap.
+    # other bot that left the template cron untouched. Runs with nothing new
+    # to forecast exit in seconds and make zero LLM calls.
     - cron: "11,31,51 * * * *"
+
+# GITHUB_TOKEN may call GitHub Models (free tier), and read the repo. Nothing else.
+permissions:
+  contents: read
+  models: read
 
 # One run at a time. Overlapping runs would double-forecast the same questions.
 concurrency:
@@ -28,7 +34,9 @@ concurrency:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The bot stops itself at 40 minutes (EDGEBOT_RUN_BUDGET_MINUTES) and
+    # exits cleanly; this is only a backstop.
+    timeout-minutes: 55
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -44,6 +52,12 @@ jobs:
           virtualenvs-in-project: true
           installer-parallel: true
 
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py311-${{ hashFiles('poetry.lock') }}
+
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
 
@@ -51,12 +65,11 @@ jobs:
         run: |
           poetry run python edge_bot.py --mode "${{ github.event.inputs.mode || 'tournament' }}"
         env:
-          # Flip to 'frontier' (repo Settings -> Variables) the moment
-          # LLM credits land. No code change needed.
-          EDGEBOT_TIER: ${{ vars.EDGEBOT_TIER || 'free' }}
-          # Swap the free model without editing code: repo Settings ->
-          # Variables -> EDGEBOT_FREE_MODEL
+          # "auto" probes every backend each run and uses the best that
+          # answers. Force a fixed setup via repo variable EDGEBOT_TIER.
+          EDGEBOT_TIER: ${{ vars.EDGEBOT_TIER || 'auto' }}
           EDGEBOT_FREE_MODEL: ${{ vars.EDGEBOT_FREE_MODEL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
