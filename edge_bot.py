@@ -25,12 +25,19 @@ and reflexive 50% hedging.
 
 import argparse
 import asyncio
+import email.utils
 import logging
 import os
-from datetime import datetime
+import re
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
+import requests
 
 from bot_helpers import (
     check_environment,
@@ -81,14 +88,21 @@ CALIBRATION_RULES = """
 
 
 # --------------------------------------------------------------------- #
-# MODEL TIERS
+# LLM BACKENDS
 #
-# "free"     — OpenRouter zero-cost models. Used to prove the four-stage
-#              chain end to end before the season starts, and whenever no
-#              paid credits are available. Free models are heavily rate
-#              limited, so the chain also runs at reduced depth here.
-# "frontier" — the real configuration. Set EDGEBOT_TIER=frontier once LLM
-#              credits land; nothing else needs to change.
+# No single provider is trusted. Each run, before spending any real calls,
+# the bot sends every backend in the catalogue a one-word prompt, keeps the
+# ones that answer, and chains them best-first. If the best backend rate
+# limits or dies mid-run, calls fall through to the next one instead of
+# failing the question.
+#
+# This is also how upgrades happen with nobody touching anything: the paid
+# backends (OpenRouter, the Metaculus proxy) are always in the catalogue.
+# They fail the probe while there are no credits, and the day credits land
+# they start answering and move to the front of the chain by themselves.
+#
+# EDGEBOT_TIER can still force a fixed setup: "frontier" (paid OpenRouter)
+# or "free" (OpenRouter zero-cost models). The default is "auto".
 # --------------------------------------------------------------------- #
 
 def _env(name: str, default: str) -> str:
@@ -103,70 +117,407 @@ def _env(name: str, default: str) -> str:
     return value.strip() or default
 
 
-TIER = _env("EDGEBOT_TIER", "free").lower()
+def _has(name: str) -> bool:
+    return bool(os.getenv(name, "").strip())
 
-# The free models are for proving the chain runs, not for scoring well. What
-# matters here is latency, not quality: a slow call blocks the whole run and
-# the job has a hard timeout.
-#
-# OpenRouter currently lists only eight zero-cost models, none from the major
-# labs. The nex-agi pair timed out on 100% of calls (180s, every request), so
-# the default is NVIDIA's "lightning" model instead. Override without touching
-# code by setting the EDGEBOT_FREE_MODEL repo variable. Other candidates:
-#   openrouter/inclusionai/ling-3.0-flash-vl:free
-#   openrouter/nex-agi/nex-n2.5-mini:free
-#   openrouter/liquid/lfm-2.5-2.6b:free
+
+TIER = _env("EDGEBOT_TIER", "auto").lower()
+
+# OpenRouter's zero-cost models. Last resort only: in September 2026 every
+# one tested timed out on real prompts. Kept so the chain has a floor.
 FREE_REASONER = _env(
     "EDGEBOT_FREE_MODEL", "openrouter/nvidia/nemotron-3.5-lightning:free"
 )
 FREE_SMALL = _env("EDGEBOT_FREE_SMALL_MODEL", FREE_REASONER)
 
+GITHUB_MODELS_URL = "https://models.github.ai/inference"
+POLLINATIONS_URL = "https://text.pollinations.ai/openai"
 
-def build_llm_config(tier: str) -> tuple[dict, int, int]:
-    """Return (llms, research_reports_per_question, predictions_per_report)."""
-    if tier == "frontier":
-        return (
-            {
-                "default": GeneralLlm(
-                    model=_env(
-                        "EDGEBOT_MODEL", "openrouter/anthropic/claude-opus-4.5"
-                    ),
-                    temperature=0.3,
-                    timeout=120,
-                    allowed_tries=2,
-                ),
-                "summarizer": _env(
-                    "EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"
-                ),
-                "researcher": _env(
-                    "EDGEBOT_RESEARCH_MODEL",
-                    "openrouter/perplexity/sonar-reasoning",
-                ),
-                "parser": _env(
-                    "EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"
-                ),
-            },
-            3,
-            2,
+
+@dataclass(frozen=True)
+class Backend:
+    """One way of reaching one model."""
+
+    label: str
+    model: str  # litellm model string, as GeneralLlm expects it
+    quality: int  # higher = better forecaster; orders the main chain
+    cheap: bool = False  # fine for parsing; preferred for the parser chain
+    timeout: int = 120
+    base_url: str | None = None
+    api_key_env: str | None = None
+    api_key_literal: str | None = None
+
+    def build(self, timeout: int | None = None) -> GeneralLlm:
+        kwargs: dict = {}
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        key = self.api_key_literal
+        if key is None and self.api_key_env:
+            key = os.getenv(self.api_key_env, "").strip() or None
+        if key:
+            kwargs["api_key"] = key
+        # allowed_tries=1: retrying is the chain's job, not the backend's. A
+        # backend retrying a 429 with exponential backoff just burns minutes.
+        return GeneralLlm(
+            model=self.model,
+            temperature=0.3,
+            timeout=timeout or self.timeout,
+            allowed_tries=1,
+            **kwargs,
         )
-    # free tier: one research report, one forecast, still the full four stages
-    return (
-        {
+
+
+def backend_catalogue() -> list[Backend]:
+    """Every backend worth trying. Order within equal quality is preference."""
+    cat: list[Backend] = []
+    if _has("OPENROUTER_API_KEY"):
+        cat += [
+            Backend(
+                "openrouter/claude-opus-4.5",
+                _env("EDGEBOT_MODEL", "openrouter/anthropic/claude-opus-4.5"),
+                quality=10,
+            ),
+            Backend(
+                "openrouter/gpt-5-mini",
+                _env("EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"),
+                quality=6,
+                cheap=True,
+            ),
+        ]
+    if _has("METACULUS_TOKEN"):
+        cat += [
+            Backend(
+                "metaculus-proxy/claude-sonnet-4.5",
+                "metaculus/anthropic/claude-sonnet-4-5-20250929",
+                quality=9,
+            ),
+            Backend("metaculus-proxy/gpt-4.1", "metaculus/gpt-4.1", quality=7),
+            Backend("metaculus-proxy/gpt-4o", "metaculus/gpt-4o", quality=6),
+            Backend(
+                "metaculus-proxy/gpt-4o-mini",
+                "metaculus/gpt-4o-mini",
+                quality=4,
+                cheap=True,
+            ),
+        ]
+    if _has("GITHUB_TOKEN"):
+        gh = dict(base_url=GITHUB_MODELS_URL, api_key_env="GITHUB_TOKEN")
+        # GitHub Models free tier. Limits are per model and per day, so
+        # spreading across several models multiplies the daily budget.
+        # Input is capped at ~8k tokens per request, which is why the
+        # prompts in this file are kept lean.
+        cat += [
+            Backend("github-models/gpt-4.1", "openai/openai/gpt-4.1", quality=7, **gh),
+            Backend(
+                "github-models/deepseek-v3",
+                "openai/deepseek/DeepSeek-V3-0324",
+                quality=6,
+                **gh,
+            ),
+            Backend(
+                "github-models/gpt-4o", "openai/openai/gpt-4o", quality=6, **gh
+            ),
+            Backend(
+                "github-models/gpt-4.1-mini",
+                "openai/openai/gpt-4.1-mini",
+                quality=5,
+                cheap=True,
+                **gh,
+            ),
+            Backend(
+                "github-models/gpt-4o-mini",
+                "openai/openai/gpt-4o-mini",
+                quality=4,
+                cheap=True,
+                **gh,
+            ),
+        ]
+    # Anonymous public endpoint, no key. Low priority: rate limited and of
+    # uncertain model quality, but it keeps the chain alive if all else fails.
+    cat.append(
+        Backend(
+            "pollinations/openai",
+            "openai/openai",
+            quality=3,
+            timeout=90,
+            base_url=POLLINATIONS_URL,
+            api_key_literal="anonymous",
+        )
+    )
+    if _has("OPENROUTER_API_KEY"):
+        cat.append(
+            Backend("openrouter/free", FREE_REASONER, quality=1, timeout=60)
+        )
+    return cat
+
+
+def _status_code(exc: BaseException) -> int | None:
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def _short_error(exc: BaseException) -> str:
+    text = " ".join(str(exc).split())
+    code = _status_code(exc)
+    prefix = f"{type(exc).__name__}" + (f" [{code}]" if code else "")
+    return f"{prefix}: {text[:220]}"
+
+
+_HARD_FAIL_CODES = {401, 402, 403, 404, 429}
+_HARD_FAIL_TEXT = (
+    "insufficient",
+    "credits",
+    "quota",
+    "rate limit",
+    "ratelimit",
+    "unauthorized",
+    "not authorized",
+    "permission",
+    "no access",
+    "not found",
+    "does not exist",
+    "unknown model",
+    "invalid api key",
+    "invalid_api_key",
+)
+
+
+def _is_hard_failure(exc: BaseException) -> bool:
+    """Failures that will not fix themselves within this run."""
+    if _status_code(exc) in _HARD_FAIL_CODES:
+        return True
+    text = str(exc).lower()
+    if "too large" in text or "tokens_limit" in text or "context length" in text:
+        return False  # this prompt is too big for it; the next one may fit
+    return any(marker in text for marker in _HARD_FAIL_TEXT)
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    return isinstance(exc, asyncio.TimeoutError) or "timeout" in type(
+        exc
+    ).__name__.lower()
+
+
+class FallbackLlm(GeneralLlm):
+    """A GeneralLlm that walks a chain of backends until one answers.
+
+    Everything in the framework (the bot, structure_output, the researcher)
+    only ever calls `.invoke`, so overriding that one method is enough.
+    Disabled backends are shared across every chain in the run: once a
+    backend has hit its daily quota for the parser, the forecaster does not
+    waste a call rediscovering that.
+    """
+
+    disabled: dict[str, str] = {}
+    timeouts: dict[str, int] = {}
+    usage: dict[str, int] = {}
+
+    def __init__(self, chain: list[Backend], role: str) -> None:
+        if not chain:
+            raise ValueError(f"Empty backend chain for {role}")
+        super().__init__(model=chain[0].model, temperature=0.3, allowed_tries=1)
+        self.role = role
+        self.chain = [(backend, backend.build()) for backend in chain]
+
+    async def invoke(self, prompt, system_prompt: str | None = None) -> str:
+        errors: list[str] = []
+        for sweep in range(2):
+            live = [
+                (b, llm) for b, llm in self.chain if b.label not in self.disabled
+            ]
+            if not live:
+                break
+            if sweep:
+                await asyncio.sleep(15)  # brief pause before a second pass
+            for backend, llm in live:
+                if backend.label in self.disabled:
+                    continue  # disabled by a concurrent call meanwhile
+                try:
+                    answer = await llm.invoke(prompt, system_prompt)
+                except Exception as exc:  # noqa: BLE001 - we route on any failure
+                    reason = _short_error(exc)
+                    errors.append(f"{backend.label}: {reason}")
+                    if _is_hard_failure(exc):
+                        self.disabled[backend.label] = reason
+                        logger.warning(
+                            f"[{self.role}] {backend.label} disabled for this run: {reason}"
+                        )
+                    elif _is_timeout(exc):
+                        count = self.timeouts.get(backend.label, 0) + 1
+                        self.timeouts[backend.label] = count
+                        if count >= 2:
+                            self.disabled[backend.label] = "timed out twice"
+                            logger.warning(
+                                f"[{self.role}] {backend.label} disabled: timed out twice"
+                            )
+                        else:
+                            logger.warning(f"[{self.role}] {backend.label} timed out")
+                    else:
+                        logger.warning(
+                            f"[{self.role}] {backend.label} failed, trying next: {reason}"
+                        )
+                    continue
+                self.usage[backend.label] = self.usage.get(backend.label, 0) + 1
+                self.timeouts[backend.label] = 0
+                return answer
+        raise RuntimeError(
+            f"All LLM backends failed for role '{self.role}': "
+            + " | ".join(errors[-6:])
+        )
+
+
+@dataclass
+class ProbeResult:
+    backend: Backend
+    ok: bool
+    seconds: float
+    detail: str
+
+
+async def probe_backends(
+    backends: list[Backend], timeout: int = 45
+) -> list[ProbeResult]:
+    """Send each backend a trivial prompt, concurrently. Costs one call each."""
+
+    async def one(backend: Backend) -> ProbeResult:
+        start = time.monotonic()
+        try:
+            reply = await asyncio.wait_for(
+                backend.build(timeout=timeout).invoke(
+                    "Reply with the single word OK."
+                ),
+                timeout + 15,
+            )
+            return ProbeResult(
+                backend, True, time.monotonic() - start, " ".join(reply.split())[:40]
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ProbeResult(
+                backend, False, time.monotonic() - start, _short_error(exc)
+            )
+
+    return list(await asyncio.gather(*(one(b) for b in backends)))
+
+
+def llms_from_working(working: list[Backend]) -> dict:
+    """Main chain best-first; parser chain cheap-first (it only extracts)."""
+    by_quality = sorted(working, key=lambda b: -b.quality)
+    cheap_first = [b for b in by_quality if b.cheap] + [
+        b for b in by_quality if not b.cheap
+    ]
+    main_chain = FallbackLlm(by_quality, "default")
+    parser_chain = FallbackLlm(cheap_first, "parser")
+    return {
+        "default": main_chain,
+        "researcher": main_chain,
+        "summarizer": parser_chain,
+        "parser": parser_chain,
+    }
+
+
+def build_fixed_llm_config(tier: str) -> dict:
+    """The old fixed tiers, kept for EDGEBOT_TIER=frontier|free overrides."""
+    if tier == "frontier":
+        return {
             "default": GeneralLlm(
-                model=FREE_REASONER,
+                model=_env("EDGEBOT_MODEL", "openrouter/anthropic/claude-opus-4.5"),
                 temperature=0.3,
-                # 60s x 2 tries, not 180 x 3. A stuck free-tier call must cost
-                # two minutes, not nine, or one bad question eats the run.
-                timeout=60,
+                timeout=120,
                 allowed_tries=2,
             ),
-            "summarizer": FREE_SMALL,
-            "researcher": FREE_REASONER,
-            "parser": FREE_SMALL,
-        },
-        1,
-        1,
+            "summarizer": _env("EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"),
+            "researcher": _env(
+                "EDGEBOT_RESEARCH_MODEL", "openrouter/perplexity/sonar-reasoning"
+            ),
+            "parser": _env("EDGEBOT_SMALL_MODEL", "openrouter/openai/gpt-5-mini"),
+        }
+    return {
+        "default": GeneralLlm(
+            model=FREE_REASONER, temperature=0.3, timeout=60, allowed_tries=2
+        ),
+        "summarizer": FREE_SMALL,
+        "researcher": FREE_REASONER,
+        "parser": FREE_SMALL,
+    }
+
+
+# --------------------------------------------------------------------- #
+# NEWS: real headlines, so the model is not asked to recall "current news"
+# it cannot know. Google News RSS is public and needs no key.
+# --------------------------------------------------------------------- #
+
+_STOPWORDS = set(
+    "will the a an of in on at by to for from with and or be is are was were "
+    "before after than more less least most any this that these those its it "
+    "as between during within until what which who whom whose how when where "
+    "does do did has have had not no yes than end".split()
+)
+
+
+def _keyword_query(text: str, max_words: int = 6) -> str:
+    words = [
+        w.strip("?,.:;()\"'")
+        for w in text.split()
+        if w.strip("?,.:;()\"'").lower() not in _STOPWORDS
+    ]
+    words = [w for w in words if w and not w.isdigit()]
+    return " ".join(words[:max_words])
+
+
+def _fetch_headlines_sync(query: str, max_items: int = 12) -> list[tuple]:
+    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+        {"q": f"{query} when:30d", "hl": "en-US", "gl": "US", "ceid": "US:en"}
     )
+    response = requests.get(
+        url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (EdgeBot research)"}
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    items = []
+    for item in root.iter("item"):
+        title = " ".join((item.findtext("title") or "").split())
+        raw_date = (item.findtext("pubDate") or "").strip()
+        try:
+            published = email.utils.parsedate_to_datetime(raw_date)
+        except (TypeError, ValueError):
+            published = None
+        if title:
+            items.append((published, title))
+        if len(items) >= max_items:
+            break
+    return items
+
+
+async def fetch_headlines(queries: list[str], limit: int = 15) -> str:
+    """Headlines for several queries, deduplicated, newest first."""
+    seen: set[str] = set()
+    collected: list[tuple] = []
+    for query in queries:
+        if not query.strip():
+            continue
+        try:
+            items = await asyncio.to_thread(_fetch_headlines_sync, query)
+        except Exception as exc:  # noqa: BLE001 - news is best effort
+            logger.warning(f"Headline fetch failed for '{query}': {exc}")
+            continue
+        for published, title in items:
+            key = title.lower()[:90]
+            if key not in seen:
+                seen.add(key)
+                collected.append((published, title))
+    collected.sort(
+        key=lambda pair: pair[0].timestamp() if pair[0] else 0, reverse=True
+    )
+    lines = [
+        f"- {published.strftime('%Y-%m-%d') if published else 'undated'}: {title}"
+        for published, title in collected[:limit]
+    ]
+    return "\n".join(lines)
+
 
 
 class EdgeBot(SummerTemplateBot2026):
@@ -180,11 +531,43 @@ class EdgeBot(SummerTemplateBot2026):
     # RESEARCH: two passes — current evidence, then historical frequency  #
     # ------------------------------------------------------------------ #
 
+    async def _search_queries(self, question: MetaculusQuestion) -> list[str]:
+        """Two to three short news queries; keyword fallback if the LLM fails."""
+        fallback = [_keyword_query(question.question_text)]
+        prompt = clean_indents(
+            f"""
+            Write 3 short Google News search queries (2 to 5 words each) that would
+            surface the latest news relevant to this forecasting question.
+            One query per line. No numbering, no quotes, nothing else.
+
+            Question: {question.question_text}
+            """
+        )
+        try:
+            raw = await self.get_llm("parser", "llm").invoke(prompt)
+        except Exception as exc:  # noqa: BLE001 - fall back to keywords
+            logger.warning(f"Query generation failed, using keywords: {exc}")
+            return fallback
+        queries = []
+        for line in raw.splitlines():
+            line = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s*", "", line).strip().strip("\"'")
+            if 1 <= len(line.split()) <= 8:
+                queries.append(line)
+        return queries[:3] or fallback
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
+            queries = await self._search_queries(question)
+            headlines = await fetch_headlines(queries)
+            logger.info(
+                f"Headlines for {question.page_url} (queries: {queries}):\n"
+                f"{headlines or '(none)'}"
+            )
+            today = datetime.now().strftime("%Y-%m-%d")
             news_prompt = clean_indents(
                 f"""
                 You are a research assistant to a superforecaster. You do not forecast.
+                Today is {today}.
 
                 Gather the most decision-relevant current information on this question.
                 Prioritise: (a) facts that have already happened and cannot be undone,
@@ -192,6 +575,14 @@ class EdgeBot(SummerTemplateBot2026):
                 (c) statements by people with the actual power to cause or block the outcome.
                 Explicitly flag anything that is speculation, rumour or opinion rather than fact.
                 If the question would already resolve one way on today's information, say so plainly.
+
+                Your own knowledge stops at your training date. Anything more recent is known
+                ONLY from the headlines below, which were retrieved today and are real. Say which
+                points come from the headlines and which from background knowledge. Never invent
+                news; if the headlines are silent on something, say that it is unknown.
+
+                Headlines, newest first:
+                {headlines or "(no headlines were found)"}
 
                 Question:
                 {question.question_text}
@@ -637,7 +1028,216 @@ class EdgeBot(SummerTemplateBot2026):
 
 # ---------------------------------------------------------------------- #
 # ENTRY POINT                                                            #
+#
+# Exit code policy: a scheduled run exits 0 unless the code itself is
+# broken. "No new questions", "no LLM backend answered" and "some questions
+# failed" are all normal operating states for a bot that runs every 20
+# minutes, and a non-zero exit makes GitHub email the repo owner every
+# time. Problems are reported instead as annotations and in the run's
+# job summary, where they are visible without spamming anyone.
 # ---------------------------------------------------------------------- #
+
+RunMode = Literal[
+    "tournament", "minibench", "metaculus_cup", "test_questions", "single", "probe"
+]
+
+
+def write_job_summary(markdown: str) -> None:
+    """Append to the GitHub Actions run page summary (no-op locally)."""
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(markdown.rstrip() + "\n\n")
+    except OSError as exc:
+        logger.warning(f"Could not write job summary: {exc}")
+
+
+def annotate(level: str, message: str) -> None:
+    """GitHub Actions annotation: shows on the run page, fails nothing."""
+    if os.getenv("GITHUB_ACTIONS"):
+        print(f"::{level}::{message}")
+    else:
+        logger.info(f"[{level}] {message}")
+
+
+def probe_table(results: list[ProbeResult]) -> str:
+    rows = ["| Backend | Result | Seconds | Detail |", "|---|---|---|---|"]
+    for r in sorted(results, key=lambda r: (not r.ok, -r.backend.quality)):
+        detail = r.detail.replace("|", "/")[:140]
+        rows.append(
+            f"| {r.backend.label} | {'OK' if r.ok else 'fail'} "
+            f"| {r.seconds:.1f} | {detail} |"
+        )
+    return "\n".join(rows)
+
+
+def collect_questions(
+    client: MetaculusClient, run_mode: RunMode
+) -> list[MetaculusQuestion]:
+    """Open questions for this mode, not yet forecasted, soonest-closing first."""
+    if run_mode == "single":
+        # Smoke test: exactly one question, preferably binary (simplest type
+        # that still exercises the whole chain). Re-forecasting is allowed.
+        pool = client.get_all_open_questions_from_tournament("bot-testing-area")
+        binaries = [q for q in pool if isinstance(q, BinaryQuestion)]
+        return (binaries or pool)[:1]
+
+    tournament_ids: list[int | str] = {
+        "tournament": [client.CURRENT_AI_COMPETITION_ID, client.CURRENT_MINIBENCH_ID],
+        "minibench": [client.CURRENT_MINIBENCH_ID],
+        "metaculus_cup": [client.CURRENT_METACULUS_CUP_ID],
+        "test_questions": ["bot-testing-area"],
+    }[run_mode]
+    reforecast = run_mode in ("metaculus_cup", "test_questions")
+
+    questions: list[MetaculusQuestion] = []
+    for tournament_id in tournament_ids:
+        try:
+            found = client.get_all_open_questions_from_tournament(tournament_id)
+        except Exception as exc:  # noqa: BLE001 - one bad feed must not stop the other
+            annotate("warning", f"Could not list tournament {tournament_id}: {exc}")
+            continue
+        fresh = [q for q in found if reforecast or not q.already_forecasted]
+        logger.info(
+            f"Tournament {tournament_id}: {len(found)} open, {len(fresh)} to forecast"
+        )
+        questions += fresh
+
+    far_future = datetime.max.replace(tzinfo=timezone.utc)
+
+    def closes(q: MetaculusQuestion) -> datetime:
+        close = q.close_time
+        if close is None:
+            return far_future
+        return close if close.tzinfo else close.replace(tzinfo=timezone.utc)
+
+    return sorted(questions, key=closes)
+
+
+async def run(run_mode: RunMode, publish: bool) -> None:
+    client = MetaculusClient()
+
+    # 1. Anything to do? Most scheduled runs find nothing new, and those
+    #    runs must cost zero LLM calls: free tiers have small daily quotas.
+    if run_mode == "probe":
+        questions: list[MetaculusQuestion] = []
+    else:
+        questions = collect_questions(client, run_mode)
+        if not questions:
+            logger.info("No new questions to forecast. Nothing to do.")
+            write_job_summary(f"### EdgeBot ({run_mode})\nNo new questions. Idle run.")
+            return
+        max_per_run = int(_env("EDGEBOT_MAX_QUESTIONS_PER_RUN", "12"))
+        if len(questions) > max_per_run:
+            logger.info(
+                f"{len(questions)} questions pending; doing the {max_per_run} "
+                "closing soonest now, the rest on the next run."
+            )
+            questions = questions[:max_per_run]
+
+    # 2. Pick the LLMs.
+    if TIER in ("frontier", "free"):
+        llms = build_fixed_llm_config(TIER)
+        reports_per_question, predictions_per_report = (3, 2) if TIER == "frontier" else (1, 1)
+        backend_note = f"fixed tier '{TIER}'"
+    else:
+        results = await probe_backends(backend_catalogue())
+        working = [r.backend for r in results if r.ok]
+        table = probe_table(results)
+        logger.info("Backend probe:\n" + table)
+        write_job_summary(f"### EdgeBot backend probe\n{table}")
+        if run_mode == "probe":
+            return
+        if not working:
+            annotate(
+                "error",
+                f"No LLM backend answered; {len(questions)} question(s) left for the "
+                "next run. See the probe table in the job summary.",
+            )
+            return
+        llms = llms_from_working(working)
+        best = max(working, key=lambda b: b.quality)
+        # Depth scales with what we have. Frontier-class backends get the
+        # full ensemble; quota-limited free backends get one careful pass
+        # per question so the daily budget covers every question.
+        if best.quality >= 9:
+            reports_per_question, predictions_per_report = 2, 2
+        else:
+            reports_per_question, predictions_per_report = 1, 1
+        backend_note = "chain: " + " > ".join(
+            b.label for b in sorted(working, key=lambda b: -b.quality)
+        )
+
+    logger.info(
+        f"{backend_note} | research reports/question: {reports_per_question} "
+        f"| forecasts/report: {predictions_per_report}"
+    )
+
+    bot = EdgeBot(
+        research_reports_per_question=reports_per_question,
+        predictions_per_research_report=predictions_per_report,
+        use_research_summary_to_forecast=False,
+        publish_reports_to_metaculus=publish,
+        folder_to_save_reports_to="forecast_logs/",
+        # Already filtered in collect_questions; single/test modes re-forecast.
+        skip_previously_forecasted_questions=False,
+        extra_metadata_in_explanation=True,
+        llms=llms,
+    )
+    if reports_per_question == 1:
+        # One parse, not two: with a single cheap parser, two samples that
+        # disagree on formatting would throw away a perfectly good forecast.
+        bot._structure_output_validation_samples = 1
+
+    # 3. Forecast, inside a hard time budget so the job never hits GitHub's
+    #    timeout (a cancelled run also emails). Each question is published
+    #    as soon as it is done, so work finished before the cut is kept.
+    budget_minutes = int(_env("EDGEBOT_RUN_BUDGET_MINUTES", "40"))
+    for q in questions:
+        logger.info(f"Queued: {q.page_url}")
+    try:
+        reports = await asyncio.wait_for(
+            bot.forecast_questions(questions, return_exceptions=True),
+            timeout=budget_minutes * 60,
+        )
+    except asyncio.TimeoutError:
+        annotate(
+            "warning",
+            f"Stopped at the {budget_minutes}-minute budget; unfinished questions "
+            "will be picked up by the next run.",
+        )
+        reports = []
+
+    ok = [r for r in reports if not isinstance(r, BaseException)]
+    failed = [r for r in reports if isinstance(r, BaseException)]
+    bot.log_report_summary(reports, raise_errors=False)
+    print_run_summary_banner(reports, will_publish=publish)
+
+    usage = ", ".join(f"{k}: {v}" for k, v in sorted(FallbackLlm.usage.items()))
+    disabled = "; ".join(f"{k} ({v[:80]})" for k, v in FallbackLlm.disabled.items())
+    lines = [
+        f"### EdgeBot ({run_mode})",
+        f"- Questions attempted: {len(questions)}",
+        f"- Forecasts {'published' if publish else 'made (dry run)'}: {len(ok)}",
+        f"- Failed: {len(failed)}",
+        f"- LLM setup: {backend_note}",
+    ]
+    if usage:
+        lines.append(f"- Calls answered per backend: {usage}")
+    if disabled:
+        lines.append(f"- Disabled during run: {disabled}")
+    for report in ok:
+        url = getattr(getattr(report, "question", None), "page_url", "")
+        lines.append(f"  - done: {url}")
+    for exc in failed:
+        lines.append(f"  - failed: {' '.join(str(exc).split())[:200]}")
+    write_job_summary("\n".join(lines))
+
+    if failed:
+        annotate("warning", f"{len(failed)} of {len(reports)} question(s) failed.")
+
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -649,15 +1249,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=[
-            "tournament",
-            "minibench",
-            "metaculus_cup",
-            "test_questions",
-            "single",
-        ],
+        choices=list(RunMode.__args__),
         default="tournament",
-        help="What to forecast on (default: tournament)",
+        help="What to forecast on (default: tournament). 'probe' only tests "
+        "which LLM backends answer.",
     )
     parser.add_argument(
         "--dry-run",
@@ -665,82 +1260,11 @@ if __name__ == "__main__":
         help="Run the full chain but do not publish to Metaculus",
     )
     args = parser.parse_args()
-    run_mode: Literal[
-        "tournament", "minibench", "metaculus_cup", "test_questions", "single"
-    ] = args.mode
+    run_mode: RunMode = args.mode
 
     check_environment(strict=True)
     publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
+    logger.info(f"Model tier: {TIER}")
 
-    llms, reports_per_question, predictions_per_report = build_llm_config(TIER)
-    logger.info(
-        f"Model tier: {TIER} | research reports/question: {reports_per_question} "
-        f"| forecasts/report: {predictions_per_report}"
-    )
-
-    bot = EdgeBot(
-        # On the frontier tier, three independent research reports give
-        # genuinely different evidence bases and two forecasts each keeps the
-        # median honest. The free tier drops to 1x1 to stay inside the
-        # zero-cost rate limits while still exercising all four stages.
-        research_reports_per_question=reports_per_question,
-        predictions_per_research_report=predictions_per_report,
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to="forecast_logs/",
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-        llms=llms,
-    )
-
-    client = MetaculusClient()
-    if run_mode == "tournament":
-        reports = asyncio.run(
-            bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
-        ) + asyncio.run(
-            bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "minibench":
-        reports = asyncio.run(
-            bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "metaculus_cup":
-        bot.skip_previously_forecasted_questions = False
-        reports = asyncio.run(
-            bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "single":
-        # Smoke test. Forecast exactly ONE question and stop. The point is to
-        # prove the four-stage chain completes and publishes, not to score.
-        # Prefer a binary question: simplest type, exercises the whole chain.
-        bot.skip_previously_forecasted_questions = False
-        all_questions = client.get_all_open_questions_from_tournament(
-            "bot-testing-area"
-        )
-        binaries = [q for q in all_questions if isinstance(q, BinaryQuestion)]
-        chosen = (binaries or all_questions)[:1]
-        if not chosen:
-            logger.error("No open questions found in bot-testing-area.")
-            reports = []
-        else:
-            logger.info(f"SMOKE TEST on a single question: {chosen[0].page_url}")
-            reports = asyncio.run(
-                bot.forecast_questions(chosen, return_exceptions=True)
-            )
-    else:
-        bot.skip_previously_forecasted_questions = False
-        reports = asyncio.run(
-            bot.forecast_on_tournament("bot-testing-area", return_exceptions=True)
-        )
-
-    bot.log_report_summary(reports)
-    print_run_summary_banner(reports, will_publish=publish_to_metaculus)
+    asyncio.run(run(run_mode, publish_to_metaculus))
