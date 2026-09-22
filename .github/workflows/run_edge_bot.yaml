@@ -4,7 +4,9 @@ name: EdgeBot — forecast on tournament questions
 # cron fires irregularly (in practice every few hours). So each scheduled run
 # keeps polling Metaculus every 10 minutes for up to ~5h20m, which bridges the
 # gaps between cron firings. If a run is already polling when the cron fires,
-# the new run exits within seconds.
+# the new run exits within seconds, unless that run is in its last ~40
+# minutes: then the new one starts anyway, so polling hands over without a
+# gap (main-tournament questions are open only ~1.5-2 hours).
 # Nothing here exits non-zero for normal conditions, so GitHub sends no mail.
 
 on:
@@ -51,8 +53,9 @@ jobs:
             echo "active=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           older=$(gh run list -R "$GITHUB_REPOSITORY" --workflow run_edge_bot.yaml \
-            --limit 30 --json databaseId,status \
-            --jq "[.[] | select(.status != \"completed\" and .databaseId < ${GITHUB_RUN_ID})] | length" \
+            --limit 30 --json databaseId,status,createdAt \
+            --jq "[.[] | select(.status != \"completed\" and .databaseId < ${GITHUB_RUN_ID}
+                              and ((now - (.createdAt | fromdateiso8601)) < 280*60))] | length" \
             || echo 0)
           echo "Older active runs: ${older}"
           if [ "${older:-0}" -gt 0 ]; then
